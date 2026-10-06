@@ -1,0 +1,91 @@
+# nginx-live-module build script
+#
+# Note: this file MUST stay in the repository root - nginx's --add-module /
+# --add-dynamic-module only look for `config` there. All C sources and headers
+# live in src/.
+#
+# Registers:
+#   - ngx_live_module / ngx_live_core_module  (CORE, the rtmp{} block)
+#   - ngx_live_access_module                  (LIVE, allow/deny rules)
+#   - ngx_live_http_flv_module                (HTTP, live_flv handler)
+#   - ngx_live_stat_module                    (HTTP, live_stat handler)
+
+ngx_addon_name=ngx_live_module
+
+
+# rtmp{} block framework + core (server, listen, application, live, gop_cache)
+
+ngx_module_type=CORE
+ngx_module_name="ngx_live_module ngx_live_core_module"
+ngx_module_incs=$ngx_addon_dir/src
+ngx_module_deps="$ngx_addon_dir/src/ngx_live.h \
+                 $ngx_addon_dir/src/ngx_live_core_module.h \
+                 $ngx_addon_dir/src/ngx_live_shared.h \
+                 $ngx_addon_dir/src/ngx_live_packet.h \
+                 $ngx_addon_dir/src/ngx_live_flv.h \
+                 $ngx_addon_dir/src/ngx_live_stream.h \
+                 $ngx_addon_dir/src/ngx_live_amf.h \
+                 $ngx_addon_dir/src/ngx_live_rtmp.h"
+ngx_module_srcs="$ngx_addon_dir/src/ngx_live.c \
+                 $ngx_addon_dir/src/ngx_live_core_module.c \
+                 $ngx_addon_dir/src/ngx_live_shared.c \
+                 $ngx_addon_dir/src/ngx_live_packet.c \
+                 $ngx_addon_dir/src/ngx_live_flv.c \
+                 $ngx_addon_dir/src/ngx_live_stream.c"
+
+. auto/module
+
+
+# RTMP transport (handshake, chunking, commands) over the rtmp{} core
+
+ngx_module_type=CORE
+ngx_module_name="ngx_live_rtmp_module"
+ngx_module_incs=$ngx_addon_dir/src
+ngx_module_deps="$ngx_addon_dir/src/ngx_live_amf.h \
+                 $ngx_addon_dir/src/ngx_live_rtmp.h"
+ngx_module_srcs="$ngx_addon_dir/src/ngx_live_amf.c \
+                 $ngx_addon_dir/src/ngx_live_rtmp.c \
+                 $ngx_addon_dir/src/ngx_live_rtmp_cmd.c"
+
+. auto/module
+
+
+# access rules (allow/deny publish|play) inside application{} blocks
+#
+# Listed as CORE for build/link purposes; the module itself is of
+# type NGX_LIVE_MODULE (see src/ngx_live_access_module.c), so the rtmp{}
+# framework creates per-application confs for it.
+
+ngx_module_type=CORE
+ngx_module_name=ngx_live_access_module
+ngx_module_incs=$ngx_addon_dir/src
+ngx_module_deps="$ngx_addon_dir/src/ngx_live_access_module.h"
+ngx_module_srcs=$ngx_addon_dir/src/ngx_live_access_module.c
+
+. auto/module
+
+
+# HTTP-FLV handler (live_flv on)
+#
+# ngx_module_incs is empty on purpose: nginx collects ngx_module_incs from all
+# modules into one global include list, and the CORE blocks above already add
+# src/ to it.
+
+ngx_module_type=HTTP
+ngx_module_name=ngx_live_http_flv_module
+ngx_module_incs=
+ngx_module_deps=
+ngx_module_srcs=$ngx_addon_dir/src/ngx_live_http_flv_module.c
+
+. auto/module
+
+
+# live statistics handler (live_stat on)
+
+ngx_module_type=HTTP
+ngx_module_name=ngx_live_stat_module
+ngx_module_incs=
+ngx_module_deps=
+ngx_module_srcs=$ngx_addon_dir/src/ngx_live_stat_module.c
+
+. auto/module
