@@ -65,7 +65,7 @@ ngx_module_srcs=$ngx_addon_dir/src/ngx_live_access_module.c
 . auto/module
 
 
-# HTTP-FLV handler (live_flv on)
+# HTTP-FLV handler (live_flv on) + its RFC 6455 codec
 #
 # ngx_module_incs is empty on purpose: nginx collects ngx_module_incs from all
 # modules into one global include list, and the CORE blocks above already add
@@ -74,8 +74,9 @@ ngx_module_srcs=$ngx_addon_dir/src/ngx_live_access_module.c
 ngx_module_type=HTTP
 ngx_module_name=ngx_live_http_flv_module
 ngx_module_incs=
-ngx_module_deps=
-ngx_module_srcs=$ngx_addon_dir/src/ngx_live_http_flv_module.c
+ngx_module_deps="$ngx_addon_dir/src/ngx_live_ws.h"
+ngx_module_srcs="$ngx_addon_dir/src/ngx_live_http_flv_module.c \
+                 $ngx_addon_dir/src/ngx_live_ws.c"
 
 . auto/module
 
