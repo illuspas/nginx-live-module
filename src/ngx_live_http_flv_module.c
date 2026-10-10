@@ -84,6 +84,19 @@ static void ngx_live_flv_ws_check(ngx_http_request_t *r,
 static ngx_int_t ngx_live_flv_ws_handshake(ngx_http_request_t *r,
     ngx_live_flv_ws_req_t *ws);
 
+/* WebSocket publish session (subprotocol post/publisher) */
+
+static ngx_int_t ngx_live_flv_ws_publish(ngx_http_request_t *r,
+    ngx_live_core_app_conf_t *cacf, ngx_str_t *name,
+    ngx_live_flv_ws_req_t *ws);
+static void ngx_live_flv_ws_publish_read(ngx_http_request_t *r);
+static void ngx_live_flv_ws_consume(ngx_http_request_t *r, u_char *p,
+    size_t len);
+static void ngx_live_flv_ws_on_frame(void *data, u_char opcode,
+    u_char *payload, size_t len, ngx_uint_t last);
+static void ngx_live_flv_ws_send_control(ngx_http_request_t *r,
+    ngx_uint_t opcode, const u_char *payload, size_t len);
+
 
 /* chunked decoding states */
 
@@ -124,6 +137,11 @@ typedef struct {
 
     unsigned                  body_done:1;   /* request body fully received */
     unsigned                  done:1;        /* request finished */
+    unsigned                  ws:1;          /* WebSocket publish session */
+    unsigned                  close_sent:1;  /* WS close frame already sent */
+
+    /* inbound WebSocket frame decoding (ws publish sessions) */
+    ngx_live_ws_parser_t      ws_parser;
 } ngx_live_flv_ctx_t;
 
 
@@ -357,9 +375,7 @@ ngx_live_flv_handler(ngx_http_request_t *r)
                 return NGX_HTTP_CONFLICT;
             }
 
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                          "live_flv: websocket publish not implemented yet");
-            return NGX_HTTP_NOT_IMPLEMENTED;
+            return ngx_live_flv_ws_publish(r, cacf, &name, &ws);
         }
 
         sp = ngx_live_find_stream(cacf, &name, 0);
@@ -880,6 +896,26 @@ ngx_live_flv_publisher_finish(ngx_http_request_t *r, ngx_int_t status)
 
     ngx_del_timer(r->connection->read);
 
+    if (ctx->ws) {
+
+        /*
+         * R15: the 101 already carried the response header, nothing
+         * may go through the header path again -- including the
+         * error-page branch below.  The only remaining
+         * server->client output is the WS close frame (no last_buf,
+         * R4's twin), echoed here when the client has not seen one.
+         */
+
+        if (!ctx->close_sent) {
+            ctx->close_sent = 1;
+            ngx_live_flv_ws_send_control(r, NGX_LIVE_WS_OP_CLOSE,
+                                         NULL, 0);
+        }
+
+        ngx_http_finalize_request(r, NGX_OK);
+        return;
+    }
+
     if (status >= NGX_HTTP_SPECIAL_RESPONSE) {
         /* let the framework render and flush the error page */
         ngx_http_finalize_request(r, status);
@@ -1195,6 +1231,340 @@ ngx_live_flv_ws_handshake(ngx_http_request_t *r, ngx_live_flv_ws_req_t *ws)
     }
 
     return NGX_OK;
+}
+
+
+/*
+ * Send one small control frame (pong, close) on a publish session.
+ * The bytes come from the request pool: a control frame may sit in
+ * the write filter until the socket drains, and stack memory would
+ * dangle.  Publish sessions carry a handful of server->client
+ * control bytes only, so there is no flush state machine here (an
+ * NGX_AGAIN would just defer a 2-byte frame; the request ends and
+ * the connection closes anyway).
+ */
+
+static void
+ngx_live_flv_ws_send_control(ngx_http_request_t *r, ngx_uint_t opcode,
+    const u_char *payload, size_t len)
+{
+    u_char       *data;
+    size_t        n;
+    ngx_buf_t    *b;
+    ngx_chain_t  *out;
+
+    data = ngx_pnalloc(r->pool, NGX_LIVE_WS_CTRL_MAX);
+    if (data == NULL) {
+        return;
+    }
+
+    n = ngx_live_ws_control_frame(data, NGX_LIVE_WS_CTRL_MAX, opcode,
+                                  payload, len);
+    if (n == 0) {
+        return;
+    }
+
+    b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+    if (b == NULL) {
+        return;
+    }
+
+    out = ngx_alloc_chain_link(r->pool);
+    if (out == NULL) {
+        return;
+    }
+
+    b->pos = data;
+    b->last = data + n;
+    b->memory = 1;
+    b->flush = 1;
+
+    out->buf = b;
+    out->next = NULL;
+
+    (void) ngx_http_output_filter(r, out);
+}
+
+
+/*
+ * Frame delivery for publish sessions: data frames feed the FLV
+ * parser as a plain byte stream (frame boundaries and the opcode
+ * carry no meaning, NMS semantics -- garbage fails fast inside the
+ * parser), ping is answered with a pong, close finishes the
+ * session.
+ */
+
+static void
+ngx_live_flv_ws_on_frame(void *data, u_char opcode, u_char *payload,
+    size_t len, ngx_uint_t last)
+{
+    ngx_http_request_t  *r = data;
+    ngx_live_flv_ctx_t  *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_live_http_flv_module);
+
+    switch (opcode) {
+
+    case NGX_LIVE_WS_OP_PING:
+        if (last) {
+            ngx_live_flv_ws_send_control(r, NGX_LIVE_WS_OP_PONG,
+                                         payload, len);
+        }
+        break;
+
+    case NGX_LIVE_WS_OP_CLOSE:
+        if (last) {
+
+            /* answer the close handshake; finish() must not send
+             * a second frame */
+
+            ctx->close_sent = 1;
+            ngx_live_flv_ws_send_control(r, NGX_LIVE_WS_OP_CLOSE,
+                                         NULL, 0);
+
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "live_flv: ws publish close frame");
+
+            ngx_live_flv_publisher_finish(r, NGX_HTTP_OK);
+        }
+        break;
+
+    default:
+        if (len == 0) {
+            break;
+        }
+
+        if (ngx_live_flv_process_input(r, payload, len) != NGX_OK) {
+            ngx_live_flv_publisher_finish(r, NGX_HTTP_BAD_REQUEST);
+        }
+        break;
+    }
+}
+
+
+/*
+ * Run received bytes through the frame parser (unmasking included).
+ * Every error path ends in ngx_live_flv_publisher_finish(); callers
+ * only watch ctx->done afterwards.
+ */
+
+static void
+ngx_live_flv_ws_consume(ngx_http_request_t *r, u_char *p, size_t len)
+{
+    ngx_live_flv_ctx_t *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_live_http_flv_module);
+
+    if (ngx_live_ws_parser_feed(&ctx->ws_parser, p, len,
+                                ngx_live_flv_ws_on_frame, r) != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "live_flv: bad websocket frame on publish");
+        ngx_live_flv_publisher_finish(r, NGX_HTTP_BAD_REQUEST);
+    }
+}
+
+
+static void
+ngx_live_flv_ws_publish_read(ngx_http_request_t *r)
+{
+    u_char              buf[NGX_LIVE_FLV_BUF_SIZE];
+    ngx_int_t           n;
+    ngx_event_t        *rev;
+    ngx_connection_t   *c;
+    ngx_live_flv_ctx_t *ctx;
+
+    c = r->connection;
+    rev = c->read;
+
+    if (rev->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "live_flv: ws publish timed out");
+        ngx_live_flv_publisher_finish(r, NGX_HTTP_REQUEST_TIME_OUT);
+        return;
+    }
+
+    for ( ;; ) {
+
+        n = ngx_recv(c, buf, sizeof(buf));
+
+        if (n == NGX_AGAIN) {
+            break;
+        }
+
+        if (n == NGX_ERROR) {
+            ngx_live_flv_publisher_finish(r, NGX_HTTP_BAD_REQUEST);
+            return;
+        }
+
+        if (n == 0) {
+            /* peer gone without a close frame: still a clean end */
+
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "live_flv: ws publish eof");
+
+            ngx_live_flv_publisher_finish(r, NGX_HTTP_OK);
+            return;
+        }
+
+        ngx_add_timer(rev, NGX_LIVE_FLV_TIMEOUT);
+
+        ngx_live_flv_ws_consume(r, buf, (size_t) n);
+
+        ctx = ngx_http_get_module_ctx(r, ngx_live_http_flv_module);
+
+        if (ctx->done) {
+            return;
+        }
+    }
+
+    if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+        ngx_live_flv_publisher_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    }
+}
+
+
+/*
+ * WebSocket publish session (subprotocol post/publisher): the FLV
+ * byte stream arrives in masked binary frames.  Everything except
+ * the byte source is shared with the plain HTTP publish path:
+ * stream registration, the FLV parser, the cleanup chain and the
+ * 60s read timeout.
+ */
+
+static ngx_int_t
+ngx_live_flv_ws_publish(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
+    ngx_str_t *name, ngx_live_flv_ws_req_t *ws)
+{
+    ngx_int_t               rc;
+    ngx_http_cleanup_t     *hcln;
+    ngx_live_flv_ctx_t     *ctx;
+    ngx_live_flv_cleanup_t *cln;
+    ngx_live_stream_t     **sp;
+
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_live_flv_ctx_t));
+    if (ctx == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_http_set_ctx(r, ctx, ngx_live_http_flv_module);
+
+    ctx->r = r;
+    ctx->cacf = cacf;
+    ctx->ws = 1;
+    ctx->body_left = -1;    /* unbounded byte stream, no chunked */
+
+    /*
+     * Register the stream BEFORE the 101: every problem that has an
+     * HTTP answer (409 conflict, OOM) must surface before the
+     * upgrade, where the only possible answer would be a close
+     * frame (R14).  The handler pre-check left only a tiny race
+     * window; this closes it.
+     */
+
+    sp = ngx_live_find_stream(cacf, name, 1);
+    if (sp == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (ngx_live_stream_publish(*sp, ctx) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "live_flv: stream \"%V\" already publishing", name);
+        return NGX_HTTP_CONFLICT;
+    }
+
+    ctx->stream = *sp;
+
+    ngx_live_flv_parser_init(&ctx->parser, r->pool, cacf,
+                             r->connection->log, ngx_live_flv_on_tag, ctx);
+
+    ngx_live_ws_parser_init(&ctx->ws_parser);
+
+    /* the 101 handshake; on failure roll the stream back while the
+     * framework can still render a plain HTTP error */
+
+    rc = ngx_live_flv_ws_handshake(r, ws);
+
+    if (rc != NGX_OK) {
+        ngx_live_stream_close(ctx->stream);
+        ctx->stream = NULL;
+        return rc;
+    }
+
+    /*
+     * The 101 must reach the wire right now: the write filter
+     * aggregates chains smaller than postpone_output, and a
+     * headers-only response would sit there until the session ends
+     * -- the publisher's handshake would starve (the plain HTTP
+     * publish path has the same trap, solved by its chunked
+     * trailer).  An empty sync+flush chain carries zero bytes but
+     * pushes everything buffered before it.
+     */
+
+    {
+        ngx_buf_t    b;
+        ngx_chain_t  out;
+
+        ngx_memzero(&b, sizeof(ngx_buf_t));
+        b.sync = 1;
+        b.flush = 1;
+
+        out.buf = &b;
+        out.next = NULL;
+
+        if (ngx_http_output_filter(r, &out) == NGX_ERROR) {
+            ngx_live_stream_close(ctx->stream);
+            ctx->stream = NULL;
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    hcln = ngx_http_cleanup_add(r, sizeof(ngx_live_flv_cleanup_t));
+    if (hcln == NULL) {
+        /* the 101 is out: finish via the close-frame path; NGX_DONE
+         * keeps the framework from writing an error page after it */
+
+        ngx_live_flv_publisher_finish(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_DONE;
+    }
+
+    cln = hcln->data;
+    cln->ctx = ctx;
+    hcln->handler = ngx_live_flv_publisher_cleanup;
+
+    r->read_event_handler = ngx_live_flv_ws_publish_read;
+    r->write_event_handler = ngx_http_request_empty_handler;
+
+    r->main->count++;
+
+    ngx_add_timer(r->connection->read, NGX_LIVE_FLV_TIMEOUT);
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                  "live_flv: ws publish started, app=%V stream=%V",
+                  &cacf->name, name);
+
+    /* the first frames may have arrived pipelined with the
+     * handshake (R3) */
+
+    if (r->header_in && r->header_in->pos < r->header_in->last) {
+
+        ngx_live_flv_ws_consume(r, r->header_in->pos,
+                                r->header_in->last - r->header_in->pos);
+
+        r->header_in->pos = r->header_in->last;
+
+        if (ctx->done) {
+            return NGX_OK;
+        }
+    }
+
+    ngx_live_flv_ws_publish_read(r);
+
+    if (ctx->done) {
+        return NGX_OK;
+    }
+
+    return NGX_DONE;
 }
 
 
