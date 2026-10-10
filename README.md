@@ -1,6 +1,6 @@
 # nginx-live-module
 
-现代化 nginx 直播流媒体模块：一个模块搞定 **RTMP** 与 **HTTP-FLV** 推流/播放，纯 C 实现，静态或动态编译进 nginx。
+现代化 nginx 直播流媒体模块：一个模块搞定 **RTMP**、**HTTP-FLV** 与 **WebSocket-FLV** 推流/播放，纯 C 实现，静态或动态编译进 nginx。
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)
@@ -10,7 +10,7 @@
 ## 为什么用它
 
 - **不用装第二套服务**：模块编进你已经在跑的 nginx，不需要 FFmpeg 转封装、不需要额外的媒体服务器进程
-- **一推多出、零拷贝**：同一路推流同时被 RTMP 与 HTTP-FLV 播放，引用计数共享缓冲，1 推 N 拉不做放大拷贝
+- **一推多出、零拷贝**：同一路推流同时被 RTMP、HTTP-FLV 与 WebSocket-FLV 播放，引用计数共享缓冲，1 推 N 拉不做放大拷贝
 - **开箱秒开**：GOP cache 关键帧对齐，HTTP-FLV 播放端首帧 ≤ 1 GOP
 - **面向现代编码器**：Enhanced RTMP v1 支持 AV1 / VP9 / HEVC（视频）与 Opus / AC-3 / EAC-3（音频）
 - **配置与 nginx-rtmp-module 兼容**：`rtmp { server { application { } } }` 结构照搬，迁移只改 HTTP 侧指令前缀
@@ -74,6 +74,12 @@ ffplay rtmp://127.0.0.1:1935/myapp/test
 # HTTP-FLV 播放（同一路流）
 ffplay http://127.0.0.1:8080/myapp/test.flv
 
+# WebSocket-FLV 推流（FFmpeg 8.0+ 原生 ws 协议；自编译内置子协议的版本可省略 -subprotocol）
+ffmpeg -re -i input.mp4 -c copy -f flv -subprotocol post ws://127.0.0.1:8080/myapp/test.flv
+
+# WebSocket-FLV 播放（浏览器端可用 flv.js / NodePlayer）
+ffplay ws://127.0.0.1:8080/myapp/test.flv
+
 # 状态
 curl -s http://127.0.0.1:8080/stat | jq .
 ```
@@ -85,6 +91,8 @@ curl -s http://127.0.0.1:8080/stat | jq .
 | RTMP 推/拉 | ✅ | ✅ |
 | HTTP-FLV 推流（`POST /app/name.flv`） | ✅ | ❌ |
 | HTTP-FLV 拉流（`GET /app/name.flv`） | ✅ | ❌ |
+| WebSocket-FLV 推流（子协议 `post`，NMS 同款契约） | ✅ | ❌ |
+| WebSocket-FLV 拉流（`ws://` / `wss://`，同端口同 location） | ✅ | ❌ |
 | Enhanced RTMP v1（AV1 / VP9 / HEVC / Opus / AC-3 / EAC-3） | ✅ | ❌ |
 | 零拷贝 fan-out（引用计数共享缓冲） | ✅ | ❌ |
 | 访问控制跨协议共用（`allow/deny publish\|play`） | ✅ | 部分 |
@@ -100,6 +108,10 @@ curl -s http://127.0.0.1:8080/stat | jq .
   AMF0 命令，publish/play 全流程；与 FFmpeg / Node-Media-Server / nginx-rtmp-module 互通
 - HTTP-FLV：`POST /app/name` 推流（chunked / Content-Length / 100-continue），
   `GET /app/name.flv` 播放（chunked，秒开 ≤ 1 GOP）
+- WebSocket-FLV：与 HTTP-FLV 同端口同 location、逐请求升级（RFC 6455）。方向由握手
+  子协议判定——携带 `Sec-WebSocket-Protocol: post`（或 `publisher`）为推流，
+  缺省为播放；线上字节与 HTTP-FLV 完全一致，仅按 tag 粒度封装 WS 二进制帧，
+  flv.js / NodePlayer / ffplay 直接可播。`wss://` 由 `listen ... ssl` 直接提供
 - 零拷贝 fan-out：引用计数共享缓冲，1 推 N 拉无放大拷贝
 - GOP cache：关键帧对齐秒开，整 GOP 缓存 + 条数上限兜底，逐级继承
 - 背压：慢速订阅者丢帧重同步 / 断开，不影响发布者与其他订阅者

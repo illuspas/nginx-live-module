@@ -97,6 +97,14 @@ static void ngx_live_flv_ws_on_frame(void *data, u_char opcode,
 static void ngx_live_flv_ws_send_control(ngx_http_request_t *r,
     ngx_uint_t opcode, const u_char *payload, size_t len);
 
+/* WebSocket play read loop */
+
+static void ngx_live_flv_ws_read(ngx_http_request_t *r);
+static void ngx_live_flv_ws_play_consume(ngx_live_flv_player_t *p,
+    u_char *buf, size_t len);
+static void ngx_live_flv_ws_play_on_frame(void *data, u_char opcode,
+    u_char *payload, size_t len, ngx_uint_t last);
+
 
 /* chunked decoding states */
 
@@ -201,6 +209,10 @@ struct ngx_live_flv_player_s {
     unsigned                 ending:1;  /* chunked trailer queued */
     unsigned                 ws:1;      /* WebSocket session: output is
                                           * RFC 6455 framed (phase 3) */
+    unsigned                 ws_closed:1; /* ws close frame replied */
+
+    /* inbound WebSocket frame decoding (ws play sessions) */
+    ngx_live_ws_parser_t     ws_parser;
 };
 
 
@@ -1569,6 +1581,109 @@ ngx_live_flv_ws_publish(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
 
 
 /*
+ * WebSocket play read loop: players are silent by contract (ffplay
+ * sends nothing, R6), so there is NO read timer -- dead peers are
+ * reclaimed by the write path (send_timeout, slow-consumer cut) and
+ * by EOF/error below.  ping gets a pong, close is answered and ends
+ * the session, any client media data is ignored (C5).
+ */
+
+static void
+ngx_live_flv_ws_read(ngx_http_request_t *r)
+{
+    u_char                  buf[NGX_LIVE_FLV_BUF_SIZE];
+    ngx_int_t               n;
+    ngx_event_t            *rev;
+    ngx_connection_t       *c;
+    ngx_live_flv_player_t  *p;
+
+    p = ngx_http_get_module_ctx(r, ngx_live_http_flv_module);
+
+    if (p->closed) {
+        return;
+    }
+
+    c = r->connection;
+    rev = c->read;
+
+    for ( ;; ) {
+
+        n = ngx_recv(c, buf, sizeof(buf));
+
+        if (n == NGX_AGAIN) {
+            break;
+        }
+
+        if (n == NGX_ERROR || n == 0) {
+            ngx_live_flv_player_finish(p, NGX_HTTP_CLIENT_CLOSED_REQUEST);
+            return;
+        }
+
+        ngx_live_flv_ws_play_consume(p, buf, (size_t) n);
+
+        if (p->closed) {
+            return;
+        }
+    }
+
+    if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+        ngx_live_flv_player_finish(p, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    }
+}
+
+
+static void
+ngx_live_flv_ws_play_consume(ngx_live_flv_player_t *p, u_char *buf,
+    size_t len)
+{
+    if (ngx_live_ws_parser_feed(&p->ws_parser, buf, len,
+                                ngx_live_flv_ws_play_on_frame, p) != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, p->r->connection->log, 0,
+                      "live_flv: bad websocket frame on play");
+        ngx_live_flv_player_finish(p, NGX_HTTP_CLIENT_CLOSED_REQUEST);
+    }
+}
+
+
+static void
+ngx_live_flv_ws_play_on_frame(void *data, u_char opcode, u_char *payload,
+    size_t len, ngx_uint_t last)
+{
+    ngx_live_flv_player_t *p = data;
+
+    switch (opcode) {
+
+    case NGX_LIVE_WS_OP_PING:
+        if (last) {
+            ngx_live_flv_ws_send_control(p->r, NGX_LIVE_WS_OP_PONG,
+                                         payload, len);
+        }
+        break;
+
+    case NGX_LIVE_WS_OP_CLOSE:
+        if (last && !p->ws_closed) {
+
+            /* answer the close handshake, then finish; the queued
+             * close node of a racing stream end is skipped by the
+             * p->closed guard in player_close() */
+
+            p->ws_closed = 1;
+            ngx_live_flv_ws_send_control(p->r, NGX_LIVE_WS_OP_CLOSE,
+                                         NULL, 0);
+
+            ngx_live_flv_player_finish(p, NGX_HTTP_OK);
+        }
+        break;
+
+    default:
+        /* players send no media data; ignore text/binary/pong (C5) */
+        break;
+    }
+}
+
+
+/*
  * Playback (S4)
  */
 
@@ -1599,6 +1714,10 @@ ngx_live_flv_play(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
     p->sub.sess = p;
     p->sub.send = ngx_live_flv_player_send;
     p->sub.close = ngx_live_flv_player_close;
+
+    if (p->ws) {
+        ngx_live_ws_parser_init(&p->ws_parser);
+    }
 
     hcln = ngx_http_cleanup_add(r, sizeof(ngx_live_flv_player_cleanup_t));
     if (hcln == NULL) {
@@ -1682,7 +1801,27 @@ ngx_live_flv_play(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
                   stream->nsubscribers);
 
     r->write_event_handler = ngx_live_flv_player_write;
-    r->read_event_handler = ngx_http_test_reading;
+    r->read_event_handler = p->ws ? ngx_live_flv_ws_read
+                                  : ngx_http_test_reading;
+
+    /*
+     * ws clients may pipeline their first frames right behind the
+     * handshake request: they sit in header_in (R3).  Feed them
+     * before the first flush; a pipelined close can end the session
+     * right here.
+     */
+
+    if (p->ws && r->header_in && r->header_in->pos < r->header_in->last) {
+
+        ngx_live_flv_ws_play_consume(p, r->header_in->pos,
+                                     r->header_in->last - r->header_in->pos);
+
+        r->header_in->pos = r->header_in->last;
+
+        if (p->closed) {
+            return NGX_DONE;
+        }
+    }
 
     ngx_live_flv_player_flush(p);
 
