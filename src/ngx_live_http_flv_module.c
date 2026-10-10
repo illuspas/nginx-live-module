@@ -11,6 +11,7 @@
 #include "ngx_live_shared.h"
 #include "ngx_live_packet.h"
 #include "ngx_live_flv.h"
+#include "ngx_live_ws.h"
 #include "ngx_live_stream.h"
 #include "ngx_live_access_module.h"
 #include "ngx_live_core_module.h"
@@ -18,6 +19,19 @@
 
 typedef struct ngx_live_flv_player_s    ngx_live_flv_player_t;
 typedef struct ngx_live_flv_out_node_s  ngx_live_flv_out_node_t;
+
+
+/* WebSocket session intent detected in the request handshake */
+
+#define NGX_LIVE_FLV_WS_NO        0
+#define NGX_LIVE_FLV_WS_PLAY      1
+#define NGX_LIVE_FLV_WS_PUBLISH   2
+
+typedef struct {
+    ngx_uint_t          type;         /* NGX_LIVE_FLV_WS_* */
+    ngx_str_t           key;          /* Sec-WebSocket-Key value */
+    ngx_str_t           subprotocol;  /* publish: selected token, as spelled */
+} ngx_live_flv_ws_req_t;
 
 
 static ngx_int_t ngx_live_flv_handler(ngx_http_request_t *r);
@@ -36,7 +50,7 @@ static void ngx_live_flv_publisher_cleanup(void *data);
 
 static ngx_int_t ngx_live_flv_play(ngx_http_request_t *r,
     ngx_live_core_app_conf_t *cacf, ngx_live_stream_t *stream,
-    ngx_str_t *name);
+    ngx_str_t *name, ngx_live_flv_ws_req_t *ws);
 static void ngx_live_flv_player_write(ngx_http_request_t *r);
 static ngx_int_t ngx_live_flv_player_send(void *sess,
     ngx_live_packet_t *pkt);
@@ -62,6 +76,13 @@ static ngx_live_core_app_conf_t *ngx_live_flv_find_application(
     ngx_str_t *app);
 static ngx_int_t ngx_live_flv_safe_name(ngx_str_t *name);
 static ngx_int_t ngx_live_flv_test_expect(ngx_http_request_t *r);
+
+/* WebSocket-FLV handshake (RFC 6455) */
+
+static void ngx_live_flv_ws_check(ngx_http_request_t *r,
+    ngx_live_flv_ws_req_t *ws);
+static ngx_int_t ngx_live_flv_ws_handshake(ngx_http_request_t *r,
+    ngx_live_flv_ws_req_t *ws);
 
 
 /* chunked decoding states */
@@ -156,6 +177,8 @@ struct ngx_live_flv_player_s {
     unsigned                 busy:1;    /* out_head submitted to the
                                          * write filter (r->out owns it) */
     unsigned                 ending:1;  /* chunked trailer queued */
+    unsigned                 ws:1;      /* WebSocket session: output is
+                                          * RFC 6455 framed (phase 3) */
 };
 
 
@@ -301,7 +324,39 @@ ngx_live_flv_handler(ngx_http_request_t *r)
     }
 
     {
-        ngx_live_stream_t  **sp;
+        ngx_live_flv_ws_req_t   ws;
+        ngx_live_stream_t      **sp;
+
+        ngx_live_flv_ws_check(r, &ws);
+
+        if (ws.type == NGX_LIVE_FLV_WS_PUBLISH) {
+
+            /*
+             * WebSocket publish (subprotocol post/publisher).  Every
+             * decision that has an HTTP answer must happen BEFORE the
+             * 101 goes out (R14); the session skeleton itself is
+             * phase 4 (TP1).
+             */
+
+            if (ngx_live_access_permit(cacf, r->connection,
+                                       NGX_LIVE_ACCESS_PUBLISH) != NGX_OK)
+            {
+                return NGX_HTTP_FORBIDDEN;
+            }
+
+            if (ngx_live_find_stream(cacf, &name, 0) != NULL) {
+                /* stream table entries exist exactly while publishing */
+
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "live_flv: stream \"%V\" already publishing",
+                              &name);
+                return NGX_HTTP_CONFLICT;
+            }
+
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "live_flv: websocket publish not implemented yet");
+            return NGX_HTTP_NOT_IMPLEMENTED;
+        }
 
         sp = ngx_live_find_stream(cacf, &name, 0);
         if (sp == NULL) {
@@ -310,7 +365,7 @@ ngx_live_flv_handler(ngx_http_request_t *r)
             return NGX_HTTP_NOT_FOUND;
         }
 
-        return ngx_live_flv_play(r, cacf, *sp, &name);
+        return ngx_live_flv_play(r, cacf, *sp, &name, &ws);
     }
 
 publish:
@@ -871,12 +926,281 @@ ngx_live_flv_publisher_cleanup(void *data)
 
 
 /*
+ * WebSocket-FLV handshake (RFC 6455 4.2).
+ *
+ * ws_check() classifies the request from its headers: a complete
+ * upgrade request is either a play session (no subprotocol) or a
+ * publish session (subprotocol "post"/"publisher", the NMS
+ * convention, echoed verbatim in the 101).  Anything incomplete
+ * falls through to the plain HTTP-FLV paths.
+ */
+
+static void
+ngx_live_flv_ws_trim(ngx_str_t *v)
+{
+    while (v->len && (v->data[0] == ' ' || v->data[0] == '\t')) {
+        v->data++;
+        v->len--;
+    }
+
+    while (v->len && (v->data[v->len - 1] == ' '
+                      || v->data[v->len - 1] == '\t'))
+    {
+        v->len--;
+    }
+}
+
+
+/*
+ * Look for one comma-separated, case-insensitive token in a header
+ * value; when found, "found" gets the token exactly as spelled.
+ */
+
+static ngx_int_t
+ngx_live_flv_ws_token(ngx_str_t *value, const u_char *token, size_t len,
+    ngx_str_t *found)
+{
+    u_char  *p, *last, *start;
+    size_t   n;
+
+    p = value->data;
+    last = value->data + value->len;
+
+    while (p < last) {
+
+        while (p < last && (*p == ',' || *p == ' ' || *p == '\t')) {
+            p++;
+        }
+
+        start = p;
+
+        while (p < last && *p != ',') {
+            p++;
+        }
+
+        n = p - start;
+
+        while (n && (start[n - 1] == ' ' || start[n - 1] == '\t')) {
+            n--;
+        }
+
+        if (n == len && ngx_strncasecmp(start, (u_char *) token, len) == 0) {
+            if (found) {
+                found->data = start;
+                found->len = n;
+            }
+
+            return NGX_OK;
+        }
+    }
+
+    return NGX_DECLINED;
+}
+
+
+static void
+ngx_live_flv_ws_check(ngx_http_request_t *r, ngx_live_flv_ws_req_t *ws)
+{
+    ngx_str_t        v;
+    ngx_uint_t       i, connection, key, version;
+    ngx_list_part_t *part;
+    ngx_table_elt_t *header, *h;
+
+    ws->type = NGX_LIVE_FLV_WS_NO;
+    ws->key.data = NULL;
+    ws->key.len = 0;
+    ws->subprotocol.data = NULL;
+    ws->subprotocol.len = 0;
+
+#if (NGX_HTTP_V2)
+    if (r->stream) {
+        /* Upgrade has no meaning over HTTP/2 (R7) */
+        return;
+    }
+#endif
+
+#if (NGX_HTTP_V3)
+    if (r->connection->quic) {
+        /* ... nor over HTTP/3 */
+        return;
+    }
+#endif
+
+    if (r->http_version < NGX_HTTP_VERSION_11) {
+        return;
+    }
+
+    if (r->headers_in.upgrade == NULL
+        || r->headers_in.upgrade->value.len != sizeof("websocket") - 1
+        || ngx_strncasecmp(r->headers_in.upgrade->value.data,
+                           (u_char *) "websocket",
+                           sizeof("websocket") - 1) != 0)
+    {
+        return;
+    }
+
+    /* the handshake headers are not typed fields: scan the list */
+
+    connection = 0;
+    key = 0;
+    version = 0;
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        header = &h[i];
+        v = header->value;
+
+        if (header->key.len == sizeof("connection") - 1
+            && ngx_strncasecmp(header->key.data,
+                               (u_char *) "connection",
+                               sizeof("connection") - 1) == 0)
+        {
+            if (ngx_live_flv_ws_token(&v, (u_char *) "upgrade", 7, NULL)
+                == NGX_OK)
+            {
+                connection = 1;
+            }
+
+        } else if (header->key.len == sizeof("sec-websocket-key") - 1
+                   && ngx_strncasecmp(header->key.data,
+                                      (u_char *) "sec-websocket-key",
+                                      sizeof("sec-websocket-key") - 1) == 0)
+        {
+            ngx_live_flv_ws_trim(&v);
+
+            if (v.len) {
+                ws->key = v;
+                key = 1;
+            }
+
+        } else if (header->key.len == sizeof("sec-websocket-version") - 1
+                   && ngx_strncasecmp(header->key.data,
+                                      (u_char *) "sec-websocket-version",
+                                      sizeof("sec-websocket-version") - 1)
+                      == 0)
+        {
+            ngx_live_flv_ws_trim(&v);
+
+            if (v.len == 2 && v.data[0] == '1' && v.data[1] == '3') {
+                version = 1;
+            }
+
+        } else if (header->key.len == sizeof("sec-websocket-protocol") - 1
+                   && ngx_strncasecmp(header->key.data,
+                                      (u_char *) "sec-websocket-protocol",
+                                      sizeof("sec-websocket-protocol") - 1)
+                      == 0)
+        {
+            (void) ngx_live_flv_ws_token(&v, (u_char *) "post", 4,
+                                         &ws->subprotocol);
+
+            if (ws->subprotocol.len == 0) {
+                (void) ngx_live_flv_ws_token(&v, (u_char *) "publisher", 9,
+                                             &ws->subprotocol);
+            }
+        }
+    }
+
+    if (!connection || !key || !version) {
+        ws->key.len = 0;
+        ws->subprotocol.len = 0;
+        return;
+    }
+
+    ws->type = ws->subprotocol.len ? NGX_LIVE_FLV_WS_PUBLISH
+                                   : NGX_LIVE_FLV_WS_PLAY;
+}
+
+
+/*
+ * Send the 101 handshake (play and publish sessions).  Deliberately
+ * touches nothing else in headers_out (R2): no content type, no
+ * content length -- the body filter chain is byte-transparent for
+ * 1xx responses, so the session keeps writing through
+ * ngx_http_output_filter() once its output is WS framed.
+ */
+
+static ngx_int_t
+ngx_live_flv_ws_handshake(ngx_http_request_t *r, ngx_live_flv_ws_req_t *ws)
+{
+    u_char           accept[NGX_LIVE_WS_ACCEPT_LEN + 1];
+    ngx_int_t        rc;
+    ngx_table_elt_t *h;
+
+    if (ngx_live_ws_accept_key(&ws->key, accept) == NULL) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    r->headers_out.status = 101;
+    ngx_str_set(&r->headers_out.status_line, "101 Switching Protocols");
+
+    /* the upgraded connection is never recycled (R5); the header
+     * filter emits "Connection: upgrade" for 101 by itself */
+
+    r->keepalive = 0;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_str_set(&h->key, "Upgrade");
+    ngx_str_set(&h->value, "websocket");
+    h->hash = 1;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_str_set(&h->key, "Sec-WebSocket-Accept");
+    h->value.data = accept;
+    h->value.len = NGX_LIVE_WS_ACCEPT_LEN;
+    h->hash = 1;
+
+    if (ws->type == NGX_LIVE_FLV_WS_PUBLISH) {
+        /* echo exactly the one selected token (R13) */
+
+        h = ngx_list_push(&r->headers_out.headers);
+        if (h == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_str_set(&h->key, "Sec-WebSocket-Protocol");
+        h->value = ws->subprotocol;
+        h->hash = 1;
+    }
+
+    rc = ngx_http_send_header(r);
+
+    if (rc == NGX_ERROR || rc > NGX_OK) {
+        return rc;
+    }
+
+    return NGX_OK;
+}
+
+
+/*
  * Playback (S4)
  */
 
 static ngx_int_t
 ngx_live_flv_play(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
-    ngx_live_stream_t *stream, ngx_str_t *name)
+    ngx_live_stream_t *stream, ngx_str_t *name, ngx_live_flv_ws_req_t *ws)
 {
     ngx_int_t                      rc;
     ngx_http_cleanup_t            *hcln;
@@ -896,6 +1220,7 @@ ngx_live_flv_play(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
     p->cacf = cacf;
     p->stream = stream;
     p->last_progress = ngx_current_msec;
+    p->ws = (ws->type == NGX_LIVE_FLV_WS_PLAY) ? 1 : 0;
 
     p->sub.sess = p;
     p->sub.send = ngx_live_flv_player_send;
@@ -910,17 +1235,26 @@ ngx_live_flv_play(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
     pcln->player = p;
     hcln->handler = ngx_live_flv_player_cleanup;
 
-    /* headers: keep content_length_n unset so the chunked filter
-     * takes over the framing */
-
-    r->headers_out.status = NGX_HTTP_OK;
-    r->headers_out.content_type_len = sizeof("video/x-flv") - 1;
-    r->headers_out.content_type.len = sizeof("video/x-flv") - 1;
-    r->headers_out.content_type.data = (u_char *) "video/x-flv";
+    /*
+     * Plain HTTP: keep content_length_n unset so the chunked filter
+     * takes over the framing.  WebSocket: answer the RFC 6455
+     * handshake with 101 -- status line and headers only, no content
+     * metadata ever touched (R1/R2).
+     */
 
     r->main->count++;
 
-    rc = ngx_http_send_header(r);
+    if (p->ws) {
+        rc = ngx_live_flv_ws_handshake(r, ws);
+
+    } else {
+        r->headers_out.status = NGX_HTTP_OK;
+        r->headers_out.content_type_len = sizeof("video/x-flv") - 1;
+        r->headers_out.content_type.len = sizeof("video/x-flv") - 1;
+        r->headers_out.content_type.data = (u_char *) "video/x-flv";
+
+        rc = ngx_http_send_header(r);
+    }
 
     if (rc == NGX_ERROR || rc > NGX_OK) {
         r->main->count--;
