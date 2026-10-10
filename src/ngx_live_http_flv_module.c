@@ -147,6 +147,10 @@ typedef struct ngx_live_flv_out_node_s {
     ngx_chain_t                    *chain;    /* first cloned link */
     ngx_chain_t                    *tail;     /* last cloned link */
     size_t                          size;     /* payload bytes queued */
+    u_char                          ws_hdr[NGX_LIVE_WS_HEADER_MAX];
+                                               /* WS frame header (ws
+                                                * sessions), or the
+                                                * 2-byte close frame */
 } ngx_live_flv_out_node_t;
 
 
@@ -1399,9 +1403,10 @@ ngx_live_flv_player_close(void *sess)
     p->detaching = 1;
 
     /*
-     * The stream ended: queue the chunked trailer and finish once
-     * it has actually gone out (flush() completes the request when
-     * everything queued, trailer included, has been sent).
+     * The stream ended: queue the chunked trailer (plain HTTP) or
+     * the WS close frame (ws sessions, via put_raw's ws branch, R4)
+     * and finish once it has actually gone out -- flush() completes
+     * the request when everything queued has been sent.
      */
 
     ngx_live_flv_player_put_raw(p, NULL, 0, 1);
@@ -1434,6 +1439,75 @@ ngx_live_flv_player_put_raw(ngx_live_flv_player_t *p, u_char *data,
 
     b = ngx_pcalloc(p->r->pool, sizeof(ngx_buf_t));
     if (b == NULL) {
+        return;
+    }
+
+    if (p->ws) {
+
+        /*
+         * WebSocket sessions: the raw buffer becomes one binary
+         * message (frame header prepended), and the closing node is
+         * the 2-byte close frame -- never an empty last_buf, which
+         * nothing in the filter chain would clear for a 101 response
+         * and which would stall the queue forever (R4).
+         */
+
+        if (data) {
+            ngx_chain_t *hdr_cl;
+            ngx_buf_t   *hb;
+            size_t       hlen;
+
+            hlen = ngx_live_ws_frame_header(node->ws_hdr, len,
+                                            NGX_LIVE_WS_OP_BINARY);
+
+            hb = ngx_pcalloc(p->r->pool, sizeof(ngx_buf_t));
+            if (hb == NULL) {
+                return;
+            }
+
+            hdr_cl = ngx_alloc_chain_link(p->r->pool);
+            if (hdr_cl == NULL) {
+                return;
+            }
+
+            hb->pos = node->ws_hdr;
+            hb->last = node->ws_hdr + hlen;
+            hb->memory = 1;
+            hb->flush = 1;
+
+            hdr_cl->buf = hb;
+            hdr_cl->next = cl;
+
+            b->pos = data;
+            b->last = data + len;
+            b->memory = 1;
+            b->flush = 1;
+
+            cl->buf = b;
+            cl->next = NULL;
+
+            node->chain = hdr_cl;
+            node->tail = cl;
+            node->size = len + hlen;
+
+        } else {
+            node->ws_hdr[0] = 0x88;    /* close, no payload */
+            node->ws_hdr[1] = 0x00;
+
+            b->pos = node->ws_hdr;
+            b->last = node->ws_hdr + 2;
+            b->memory = 1;
+            b->flush = 1;
+
+            cl->buf = b;
+            cl->next = NULL;
+
+            node->chain = cl;
+            node->tail = cl;
+            node->size = 2;
+        }
+
+        ngx_live_flv_player_put_node(p, node);
         return;
     }
 
@@ -1553,16 +1627,52 @@ ngx_live_flv_player_enqueue(ngx_live_flv_player_t *p, ngx_live_packet_t *pkt)
         return;
     }
 
+    node->size = size + 4;    /* tag bytes + PreviousTagSize trailer */
+
+    if (p->ws) {
+
+        /*
+         * One WS binary message per tag: the frame header is
+         * prepended to the cloned chain and its length is part of
+         * the node accounting (R9).
+         */
+
+        ngx_chain_t *hdr_cl;
+        ngx_buf_t   *hb;
+        size_t       hlen;
+
+        hlen = ngx_live_ws_frame_header(node->ws_hdr, node->size,
+                                        NGX_LIVE_WS_OP_BINARY);
+
+        hb = ngx_pcalloc(p->r->pool, sizeof(ngx_buf_t));
+        if (hb == NULL) {
+            return;
+        }
+
+        hdr_cl = ngx_alloc_chain_link(p->r->pool);
+        if (hdr_cl == NULL) {
+            return;
+        }
+
+        hb->pos = node->ws_hdr;
+        hb->last = node->ws_hdr + hlen;
+        hb->memory = 1;
+        hb->flush = 1;
+
+        hdr_cl->buf = hb;
+        hdr_cl->next = first;
+
+        first = hdr_cl;
+        node->size += hlen;
+    }
+
     node->shared = pkt->chain;
     node->chain = first;
     node->tail = prev_cl;
-    node->size = size;
 
     ngx_live_acquire_shared_chain(pkt->chain);
 
     ngx_live_flv_player_put_node(p, node);
-
-    p->out_size += size;
 }
 
 
@@ -1580,6 +1690,12 @@ ngx_live_flv_player_put_node(ngx_live_flv_player_t *p,
         p->node_tail = node;
         p->out_head = node->chain;
     }
+
+    /* one place for the queue accounting: tag + trailer bytes plus
+     * the WS frame header when present; drain() subtracts the same
+     * amount per completed node */
+
+    p->out_size += node->size;
 }
 
 
