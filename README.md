@@ -83,12 +83,12 @@ curl -s http://127.0.0.1:8080/stat | jq .
 | | nginx-live-module | nginx-rtmp-module |
 |---|---|---|
 | RTMP 推/拉 | ✅ | ✅ |
-| HTTP-FLV 推流（`POST /app/name`） | ✅ | ❌ |
+| HTTP-FLV 推流（`POST /app/name.flv`） | ✅ | ❌ |
+| HTTP-FLV 拉流（`GET /app/name.flv`） | ✅ | ❌ |
 | Enhanced RTMP v1（AV1 / VP9 / HEVC / Opus / AC-3 / EAC-3） | ✅ | ❌ |
 | 零拷贝 fan-out（引用计数共享缓冲） | ✅ | ❌ |
 | 访问控制跨协议共用（`allow/deny publish\|play`） | ✅ | 部分 |
 | 状态端点 | `live_stat`（JSON） | `rtmp_stat`（XML/HTML） |
-| HLS | 规划中 | ✅ |
 | 配置结构 | `rtmp { server { application { } } }`（兼容） | 同 |
 
 迁移注意：HTTP 侧指令保留 `live_` 前缀（`live_flv` / `live_stat`，无 `rtmp_stat` / `rtmp_control` 别名）；
