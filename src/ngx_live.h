@@ -39,8 +39,8 @@ typedef struct {
 
 
 #define NGX_LIVE_MODULE                 0x4C495645     /* "LIVE" */
-#define NGX_LIVE_MODULE_VERSION         "2.0.0"
-#define ngx_live_module_version         2000000
+#define NGX_LIVE_MODULE_VERSION         "2.0.2"
+#define ngx_live_module_version         2000002
 /*
  * Context flags, one per nesting level of the rtmp{} block
  * (rtmp{} -> server{} -> application{}), after ngx_rtmp_*.
