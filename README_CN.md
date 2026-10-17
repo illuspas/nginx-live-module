@@ -14,7 +14,7 @@
 - **不用装第二套服务**：模块编进你已经在跑的 nginx，不需要 FFmpeg 转封装、不需要额外的媒体服务器进程
 - **一推多出、零拷贝**：同一路推流同时被 RTMP、HTTP-FLV 与 WebSocket-FLV 播放，引用计数共享缓冲，1 推 N 拉不做放大拷贝
 - **开箱秒开**：GOP cache 关键帧对齐，HTTP-FLV 播放端首帧 ≤ 1 GOP
-- **面向现代编码器**：Enhanced RTMP v1 支持 AV1 / VP9 / HEVC（视频）与 Opus / AC-3 / EAC-3（音频）
+- **面向现代编码器**：Enhanced RTMP v1 支持 AV1 / VP9 / HEVC（视频）与 Opus / AC-3 / EAC-3（音频）；Enhanced RTMP v2 支持多音轨（Multitrack）音频
 - **配置与 nginx-rtmp-module 兼容**：`rtmp { server { application { } } }` 结构照搬，迁移只改 HTTP 侧指令前缀
 
 ## 下载（Windows x64 预编译包）
@@ -96,6 +96,7 @@ curl -s http://127.0.0.1:8080/stat | jq .
 | WebSocket-FLV 推流（子协议 `post`，NMS 同款契约） | ✅ | ❌ |
 | WebSocket-FLV 拉流（`ws://` / `wss://`，同端口同 location） | ✅ | ❌ |
 | Enhanced RTMP v1（AV1 / VP9 / HEVC / Opus / AC-3 / EAC-3） | ✅ | ❌ |
+| Enhanced RTMP v2 多音轨（Multitrack） | ✅ | ❌ |
 | 零拷贝 fan-out（引用计数共享缓冲） | ✅ | ❌ |
 | 访问控制跨协议共用（`allow/deny publish\|play`） | ✅ | 部分 |
 | 状态端点 | `live_stat`（JSON） | `rtmp_stat`（XML/HTML） |
@@ -108,6 +109,9 @@ curl -s http://127.0.0.1:8080/stat | jq .
 
 - RTMP：SimpleHandshake，chunk 协议（入站动态 chunk size、扩展时间戳、fmt0-3 全格式），
   AMF0 命令，publish/play 全流程；与 FFmpeg / Node-Media-Server / nginx-rtmp-module 互通
+- Enhanced RTMP v2 多音轨（Multitrack）音频：支持 OneTrack、ManyTracks-ManyTracks、
+  ManyTracks-OneTrack 三种封装模式，最多 16 路音轨；逐轨缓存 sequence header，新观众加入时各自回放，
+  音轨数据原样透传（不转码、不重封装）
 - HTTP-FLV：`POST /app/name` 推流（chunked / Content-Length / 100-continue），
   `GET /app/name.flv` 播放（chunked，秒开 ≤ 1 GOP）
 - WebSocket-FLV：与 HTTP-FLV 同端口同 location、逐请求升级（RFC 6455）。方向由握手

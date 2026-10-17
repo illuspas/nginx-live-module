@@ -14,7 +14,7 @@ A modern live-streaming module for nginx: one module handles **RTMP**, **HTTP-FL
 - **No second service to run**: the module is compiled into the nginx you already run — no FFmpeg remuxing, no separate media-server process
 - **One publisher, many viewers, zero copy**: a single stream is played simultaneously over RTMP, HTTP-FLV and WebSocket-FLV; reference-counted shared buffers mean 1 publish to N pulls requires no amplified copying
 - **Instant playback out of the box**: keyframe-aligned GOP cache gets the first frame to HTTP-FLV players in ≤ 1 GOP
-- **Built for modern codecs**: Enhanced RTMP v1 supports AV1 / VP9 / HEVC (video) and Opus / AC-3 / EAC-3 (audio)
+- **Built for modern codecs**: Enhanced RTMP v1 supports AV1 / VP9 / HEVC (video) and Opus / AC-3 / EAC-3 (audio); Enhanced RTMP v2 supports multitrack audio
 - **Configuration compatible with nginx-rtmp-module**: the `rtmp { server { application { } } }` structure is identical, so migration only requires changing the HTTP-side directive prefix
 
 ## Download (prebuilt Windows x64 package)
@@ -96,6 +96,7 @@ curl -s http://127.0.0.1:8080/stat | jq .
 | WebSocket-FLV publish (subprotocol `post`, same contract as NMS) | ✅ | ❌ |
 | WebSocket-FLV playback (`ws://` / `wss://`, same port and location) | ✅ | ❌ |
 | Enhanced RTMP v1 (AV1 / VP9 / HEVC / Opus / AC-3 / EAC-3) | ✅ | ❌ |
+| Enhanced RTMP v2 multitrack audio | ✅ | ❌ |
 | Zero-copy fan-out (reference-counted shared buffers) | ✅ | ❌ |
 | Access control shared across protocols (`allow/deny publish\|play`) | ✅ | Partial |
 | Status endpoint | `live_stat` (JSON) | `rtmp_stat` (XML/HTML) |
@@ -108,6 +109,10 @@ Migration notes: HTTP-side directives keep the `live_` prefix (`live_flv` / `liv
 
 - RTMP: SimpleHandshake, chunk protocol (inbound dynamic chunk size, extended timestamps, all fmt0-3 formats),
   AMF0 commands, full publish/play flow; interoperates with FFmpeg / Node-Media-Server / nginx-rtmp-module
+- Enhanced RTMP v2 multitrack audio: supports all three encapsulation modes — OneTrack,
+  ManyTracks-ManyTracks and ManyTracks-OneTrack — with up to 16 audio tracks; per-track sequence
+  headers are cached and replayed to each joining player, and the audio data is passed through
+  as-is (no transcoding, no remuxing)
 - HTTP-FLV: publish with `POST /app/name` (chunked / Content-Length / 100-continue),
   play with `GET /app/name.flv` (chunked, instant start in ≤ 1 GOP)
 - WebSocket-FLV: same port and location as HTTP-FLV, per-request upgrade (RFC 6455). Direction is determined by the handshake
