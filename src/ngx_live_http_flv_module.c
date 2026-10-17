@@ -1697,6 +1697,7 @@ ngx_live_flv_play(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
     ngx_live_flv_player_cleanup_t *pcln;
     ngx_live_gop_node_t           *node;
     ngx_queue_t                   *item;
+    ngx_uint_t                     i;
 
     p = ngx_pcalloc(r->pool, sizeof(ngx_live_flv_player_t));
     if (p == NULL) {
@@ -1763,8 +1764,10 @@ ngx_live_flv_play(ngx_http_request_t *r, ngx_live_core_app_conf_t *cacf,
         ngx_live_flv_player_enqueue(p, stream->meta);
     }
 
-    if (stream->audio_header) {
-        ngx_live_flv_player_enqueue(p, stream->audio_header);
+    for (i = 0; i < NGX_LIVE_MAX_AUDIO_TRACKS; i++) {
+        if (stream->audio_headers[i]) {
+            ngx_live_flv_player_enqueue(p, stream->audio_headers[i]);
+        }
     }
 
     if (stream->video_header) {

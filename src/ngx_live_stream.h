@@ -18,6 +18,12 @@
 #define NGX_LIVE_STREAM_BUCKETS  256
 
 /*
+ * Per-track audio sequence headers kept by a stream (Enhanced RTMP
+ * v2 multitrack audio).  Track 0 is the plain (legacy) audio track.
+ */
+#define NGX_LIVE_MAX_AUDIO_TRACKS 16
+
+/*
  * Hard cap on cached packets per GOP.  A normal GOP (x264/x265
  * default keyint=250 plus interleaved audio is ~700 packets) never
  * reaches it; it only guards against pathological streams without
@@ -79,7 +85,7 @@ struct ngx_live_stream_s {
 
     /* startup sequence cache (chains acquired) */
     ngx_live_packet_t          *meta;
-    ngx_live_packet_t          *audio_header;
+    ngx_live_packet_t          *audio_headers[NGX_LIVE_MAX_AUDIO_TRACKS];
     ngx_live_packet_t          *video_header;
 
     /* GOP cache: rebuilt from each video keyframe */

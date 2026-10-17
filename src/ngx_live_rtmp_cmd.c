@@ -465,6 +465,7 @@ ngx_live_rtmp_play(ngx_live_rtmp_session_t *s, ngx_live_rtmp_header_t *h,
     ngx_str_t               name, args;
     ngx_log_t              *log;
     ngx_queue_t            *item;
+    ngx_uint_t              i;
     ngx_live_stream_t      **sp;
     ngx_live_gop_node_t    *node;
     ngx_live_amf_elt_t      top[] = {
@@ -551,9 +552,12 @@ ngx_live_rtmp_play(ngx_live_rtmp_session_t *s, ngx_live_rtmp_header_t *h,
                                          s->msid, (*sp)->meta);
     }
 
-    if ((*sp)->audio_header) {
-        (void) ngx_live_rtmp_send_packet(s, NGX_LIVE_RTMP_CSID_AUDIO,
-                                         s->msid, (*sp)->audio_header);
+    for (i = 0; i < NGX_LIVE_MAX_AUDIO_TRACKS; i++) {
+        if ((*sp)->audio_headers[i]) {
+            (void) ngx_live_rtmp_send_packet(s, NGX_LIVE_RTMP_CSID_AUDIO,
+                                             s->msid,
+                                             (*sp)->audio_headers[i]);
+        }
     }
 
     if ((*sp)->video_header) {

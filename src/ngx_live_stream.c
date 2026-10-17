@@ -93,6 +93,7 @@ ngx_live_stream_close(ngx_live_stream_t *stream)
     ngx_queue_t           *item, *next;
     ngx_live_subscriber_t *sub;
     ngx_live_stream_t    **sp;
+    ngx_uint_t             i;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, stream->app_conf->log, 0,
                    "live: stream '%s' closing", stream->name);
@@ -128,9 +129,11 @@ ngx_live_stream_close(ngx_live_stream_t *stream)
         stream->meta = NULL;
     }
 
-    if (stream->audio_header) {
-        ngx_live_stream_free_packet(stream, stream->audio_header);
-        stream->audio_header = NULL;
+    for (i = 0; i < NGX_LIVE_MAX_AUDIO_TRACKS; i++) {
+        if (stream->audio_headers[i]) {
+            ngx_live_stream_free_packet(stream, stream->audio_headers[i]);
+            stream->audio_headers[i] = NULL;
+        }
     }
 
     if (stream->video_header) {
@@ -197,12 +200,20 @@ ngx_live_stream_packet(ngx_live_stream_t *stream, ngx_live_packet_t *pkt)
     switch (pkt->flags) {
 
     case NGX_LIVE_FLAG_AUDIO_HEADER:
-        cp = ngx_live_stream_cache_packet(stream, pkt);
-        if (cp) {
-            if (stream->audio_header) {
-                ngx_live_stream_free_packet(stream, stream->audio_header);
+        /*
+         * Multitrack audio keeps one sequence header per track
+         * (pkt->audio_track, 0 for plain audio).  Out-of-range tracks
+         * are not cached, but still fan out below.
+         */
+        if (pkt->audio_track < NGX_LIVE_MAX_AUDIO_TRACKS) {
+            cp = ngx_live_stream_cache_packet(stream, pkt);
+            if (cp) {
+                if (stream->audio_headers[pkt->audio_track]) {
+                    ngx_live_stream_free_packet(stream,
+                                                stream->audio_headers[pkt->audio_track]);
+                }
+                stream->audio_headers[pkt->audio_track] = cp;
             }
-            stream->audio_header = cp;
         }
         break;
 

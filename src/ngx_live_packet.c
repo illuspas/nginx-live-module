@@ -45,6 +45,15 @@ ngx_live_chain_read(ngx_chain_t *in, u_char *dst, size_t n)
 #define NGX_LIVE_EX_SEQ_END         2   /* SequenceEnd: ignored */
 #define NGX_LIVE_EX_CODED_FRAMES_X  3   /* CodedFramesX: never has cts */
 #define NGX_LIVE_EX_METADATA        4   /* Metadata (hdrMetadata): ignored */
+#define NGX_LIVE_EX_MULTITRACK      5   /* Multitrack: Enhanced RTMP v2 */
+
+/*
+ * Multitrack modes (top nibble of the byte following the
+ * AudioPacketTypeMultitrack marker).
+ */
+#define NGX_LIVE_MT_ONE_TRACK                0   /* FourCC, trackIndex, body */
+#define NGX_LIVE_MT_MANY_TRACKS_MANY_TRACKS  1   /* trackIndex, wrapped tag */
+#define NGX_LIVE_MT_MANY_TRACKS_ONE_TRACK    2   /* FourCC, count, idx[], body */
 
 
 static uint32_t
@@ -69,7 +78,7 @@ ngx_live_packet_identify(ngx_live_packet_t *pkt)
         return NGX_OK;
 
     case NGX_LIVE_AUDIO:
-        n = ngx_live_chain_read(pkt->chain, b, 5);
+        n = ngx_live_chain_read(pkt->chain, b, 8);
         if (n < 1) {
             return NGX_ERROR;
         }
@@ -83,6 +92,8 @@ ngx_live_packet_identify(ngx_live_packet_t *pkt)
          */
 
         if (codec == NGX_LIVE_SOUNDFORMAT_EX) {
+            ngx_uint_t  mode, inner;
+
             if (n < 5) {
                 return NGX_ERROR;
             }
@@ -97,6 +108,73 @@ ngx_live_packet_identify(ngx_live_packet_t *pkt)
 
             case NGX_LIVE_EX_CODED_FRAMES:
                 pkt->flags = NGX_LIVE_FLAG_AUDIO;
+                break;
+
+            case NGX_LIVE_EX_MULTITRACK:
+                /*
+                 * Enhanced RTMP v2 multitrack audio:
+                 *   b0 = 0x90 | Multitrack
+                 *   b1 = (mode << 4) | wrapped AudioPacketType
+                 *   OneTrack:                b2..b5 FourCC, b6 trackIndex
+                 *   ManyTracksManyTracks:    b2 trackIndex, b3.. wrapped tag
+                 *                           (its own 0x9X byte + FourCC)
+                 *   ManyTracksOneTrack:      b2..b5 FourCC, b6 count,
+                 *                           b7.. track indexes
+                 */
+                if (n < 2) {
+                    return NGX_ERROR;
+                }
+
+                mode = b[1] >> 4;
+                inner = b[1] & 0x0f;
+
+                switch (mode) {
+
+                case NGX_LIVE_MT_ONE_TRACK:
+                    if (n < 7) {
+                        return NGX_ERROR;
+                    }
+                    pkt->codec_id = ngx_live_read_fourcc(&b[2]);
+                    pkt->audio_track = b[6];
+                    break;
+
+                case NGX_LIVE_MT_MANY_TRACKS_MANY_TRACKS:
+                    if (n < 8) {
+                        return NGX_ERROR;
+                    }
+                    pkt->codec_id = ngx_live_read_fourcc(&b[4]);
+                    pkt->audio_track = b[2];
+                    break;
+
+                case NGX_LIVE_MT_MANY_TRACKS_ONE_TRACK:
+                    if (n < 8) {
+                        return NGX_ERROR;
+                    }
+                    pkt->codec_id = ngx_live_read_fourcc(&b[2]);
+                    pkt->audio_track = b[7];    /* first of the index list */
+                    break;
+
+                default:
+                    /*
+                     * Unknown mode: leave track 0, the flags below
+                     * still classify the wrapped packet type.
+                     */
+                    break;
+                }
+
+                if (inner == NGX_LIVE_EX_SEQ_START) {
+                    pkt->flags = NGX_LIVE_FLAG_AUDIO_HEADER;
+
+                } else if (inner == NGX_LIVE_EX_CODED_FRAMES
+                           || inner == NGX_LIVE_EX_CODED_FRAMES_X)
+                {
+                    pkt->flags = NGX_LIVE_FLAG_AUDIO;
+
+                } else {
+                    /* SequenceEnd, multichannel/metadata: pass through */
+                    pkt->flags = NGX_LIVE_FLAG_IGNORED;
+                }
+
                 break;
 
             default:

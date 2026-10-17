@@ -28,6 +28,7 @@ typedef struct {
     ngx_uint_t       codec_type;    /* NGX_LIVE_AUDIO/VIDEO/SCRIPT */
     ngx_uint_t       flags;         /* NGX_LIVE_FLAG_* */
     uint32_t         codec_id;      /* legacy CodecID or FourCC uint32 */
+    ngx_uint_t       audio_track;   /* audio track index, 0 = plain audio */
     uint32_t         dts;           /* milliseconds */
     int32_t          cts;           /* composition time, pts = dts + cts */
     size_t           size;          /* tag body size, w/o 11-byte header */
@@ -48,7 +49,8 @@ size_t ngx_live_chain_read(ngx_chain_t *in, u_char *dst, size_t n);
  *
  * The chain passed here carries only the tag body (no 11-byte
  * header prepended yet).  Covers legacy FLV codecs and Enhanced
- * RTMP v1 (video: av01/vp09/hvc1, audio: ac-3/ec-3/Opus/.mp3/fLaC).
+ * RTMP v1 (video: av01/vp09/hvc1, audio: ac-3/ec-3/Opus/.mp3/fLaC)
+ * plus the Enhanced RTMP v2 multitrack audio wrapping.
  *
  * Returns NGX_OK, or NGX_ERROR on malformed data.
  */

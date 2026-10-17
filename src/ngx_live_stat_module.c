@@ -222,6 +222,7 @@ ngx_live_stat_output(ngx_http_request_t *r)
             {
                 u_char     vbuf[8], abuf[8];
                 ngx_str_t  name, vname, aname;
+                ngx_uint_t ai;
 
                 if (comma_stream) {
                     *p++ = ',';
@@ -256,15 +257,19 @@ ngx_live_stat_output(ngx_http_request_t *r)
 
                 p = ngx_sprintf(p, ",\"audio_codec\":");
 
-                if (stream->audio_header) {
-                    aname.data = ngx_live_codec_name(NGX_LIVE_AUDIO,
-                                                     stream->audio_header
-                                                                  ->codec_id,
-                                                     abuf);
-                    aname.len = ngx_strlen(abuf);
-                    p = ngx_live_stat_escape_str(p, &aname);
+                for (ai = 0; ai < NGX_LIVE_MAX_AUDIO_TRACKS; ai++) {
+                    if (stream->audio_headers[ai]) {
+                        aname.data = ngx_live_codec_name(NGX_LIVE_AUDIO,
+                                                         stream->audio_headers[ai]
+                                                                      ->codec_id,
+                                                         abuf);
+                        aname.len = ngx_strlen(abuf);
+                        p = ngx_live_stat_escape_str(p, &aname);
+                        break;
+                    }
+                }
 
-                } else {
+                if (ai == NGX_LIVE_MAX_AUDIO_TRACKS) {
                     *p++ = 'n'; *p++ = 'u'; *p++ = 'l'; *p++ = 'l';
                 }
 
